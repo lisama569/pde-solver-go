@@ -40,6 +40,7 @@ type Config struct {
 	Steps       int        // 时间步数
 	BC          Boundaries // 边界条件
 	Src         *Source    // 源项，nil 表示无源
+	Plan        *PhasePlan // 阶段计划，nil 表示按单套 BC/Src 运行（旧行为）
 }
 
 // Validate 校验配置合法性，返回 ErrKindConfig 错误。
@@ -59,24 +60,17 @@ func (c *Config) Validate() error {
 	if c.Steps < 0 {
 		return configErr(fmt.Sprintf("config: steps must be >= 0: Steps=%d", c.Steps))
 	}
-	for name, b := range map[string]Boundary{
-		"left": c.BC.Left, "right": c.BC.Right, "top": c.BC.Top, "bottom": c.BC.Bottom,
-	} {
-		if b.Type != Dirichlet && b.Type != Neumann && b.Type != Periodic {
-			return configErr(fmt.Sprintf("config: unknown boundary type on %s: %d", name, b.Type))
-		}
-	}
-	// 周期边界必须左右、上下成对出现
-	if (c.BC.Left.Type == Periodic) != (c.BC.Right.Type == Periodic) {
-		return configErr("config: periodic boundary must be paired on left/right")
-	}
-	if (c.BC.Top.Type == Periodic) != (c.BC.Bottom.Type == Periodic) {
-		return configErr("config: periodic boundary must be paired on top/bottom")
+	if err := validateBoundaries(c.BC); err != nil {
+		return err
 	}
 	if c.Src != nil {
-		s := c.Src
-		if !(0 <= s.X0 && s.X0 < s.X1 && s.X1 <= 1 && 0 <= s.Y0 && s.Y0 < s.Y1 && s.Y1 <= 1) {
-			return configErr(fmt.Sprintf("config: invalid source region: [%g,%g]x[%g,%g]", s.X0, s.X1, s.Y0, s.Y1))
+		if err := validateSource(c.Src); err != nil {
+			return err
+		}
+	}
+	if c.Plan != nil {
+		if err := c.Plan.Validate(c.Steps); err != nil {
+			return err
 		}
 	}
 	return nil

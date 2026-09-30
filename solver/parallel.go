@@ -2,6 +2,35 @@ package solver
 
 import "sync"
 
+// rowBounds 把 ny 行均分为 workers 个子域，返回 workers+1 个分界：
+// 子域 b 负责行区间 [bounds[b], bounds[b+1])。
+func rowBounds(ny, workers int) []int {
+	bounds := make([]int, workers+1)
+	for b := 0; b <= workers; b++ {
+		bounds[b] = b * ny / workers
+	}
+	return bounds
+}
+
+// stepParallel 并发推进 s 一步：各子域只写自己的行区间。
+// 调用前需已激活当前步的阶段配置（applyPhaseForStep）。
+func (s *Stepper) stepParallel(bounds []int) error {
+	var wg sync.WaitGroup
+	for b := 0; b+1 < len(bounds); b++ {
+		j0, j1 := bounds[b], bounds[b+1]
+		if j0 == j1 {
+			continue
+		}
+		wg.Add(1)
+		go func(j0, j1 int) {
+			defer wg.Done()
+			s.stepRows(j0, j1)
+		}(j0, j1)
+	}
+	wg.Wait()
+	return s.commit()
+}
+
 // RunParallel 按行把网格划分为 workers 个子域并发推进 steps 步。
 //
 // 由于采用双缓冲（读 Cur、写 Next），各子域只写自己的行区间，
@@ -15,27 +44,10 @@ func RunParallel(cfg *Config, initial *Grid, workers, steps int) (*Grid, error) 
 	if err != nil {
 		return nil, err
 	}
-	ny := cfg.NY
-	// 行分块边界：band b 负责 [b*ny/w, (b+1)*ny/w)
-	bounds := make([]int, workers+1)
-	for b := 0; b <= workers; b++ {
-		bounds[b] = b * ny / workers
-	}
-	var wg sync.WaitGroup
+	bounds := rowBounds(cfg.NY, workers)
 	for k := 0; k < steps; k++ {
-		for b := 0; b < workers; b++ {
-			j0, j1 := bounds[b], bounds[b+1]
-			if j0 == j1 {
-				continue
-			}
-			wg.Add(1)
-			go func(j0, j1 int) {
-				defer wg.Done()
-				s.stepRows(j0, j1)
-			}(j0, j1)
-		}
-		wg.Wait()
-		if err := s.commit(); err != nil {
+		s.applyPhaseForStep(s.Step)
+		if err := s.stepParallel(bounds); err != nil {
 			return nil, err
 		}
 	}

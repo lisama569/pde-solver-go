@@ -10,11 +10,19 @@ import (
 //	u^{n+1} = u^n + dt * (D * ∇²u^n + source)
 //
 // 采用双缓冲：所有新值只写入 Next，因此并行按行分块与串行结果逐位一致。
+//
+// 当 Config.Plan 非空时，Stepper 在每一步前按当前步号激活对应阶段的
+// 边界与源项配置（见 applyPhaseForStep）；Plan 为空时始终使用
+// Config.BC / Config.Src，行为与旧版本完全一致。
 type Stepper struct {
 	Cfg  *Config
 	Cur  *Grid
 	Next *Grid
 	Step int // 已完成的步数
+
+	bc       Boundaries // 当前生效的边界配置
+	srcs     []Source   // 当前生效的源项列表
+	phaseIdx int        // 当前生效的阶段索引（-1 = 尚未激活任何阶段）
 }
 
 // NewStepper 创建步进器；先校验配置合法性，再校验稳定性条件。
@@ -28,7 +36,63 @@ func NewStepper(cfg *Config, initial *Grid) (*Stepper, error) {
 	if initial == nil || initial.NX != cfg.NX || initial.NY != cfg.NY {
 		return nil, configErr(fmt.Sprintf("config: initial grid size mismatch, want %dx%d", cfg.NX, cfg.NY))
 	}
-	return &Stepper{Cfg: cfg, Cur: initial.Clone(), Next: NewGrid(cfg.NX, cfg.NY)}, nil
+	s := &Stepper{
+		Cfg:      cfg,
+		Cur:      initial.Clone(),
+		Next:     NewGrid(cfg.NX, cfg.NY),
+		bc:       cfg.BC,
+		phaseIdx: -1,
+	}
+	if cfg.Src != nil {
+		s.srcs = []Source{*cfg.Src}
+	}
+	return s, nil
+}
+
+// applyPhaseForStep 在推进步号 step 之前激活覆盖该步的阶段配置。
+// 阶段切换只发生在步边界上，是步号的确定性函数，因此断点续算与
+// 不间断运行的切换点完全一致。阶段激活时会把该阶段 Dirichlet 边界的
+// 固定值写入 Cur 的边界格（幂等：同阶段重复激活结果相同）。
+// 无阶段计划或步号超出计划范围时不做任何事。
+func (s *Stepper) applyPhaseForStep(step int) {
+	if s.Cfg.Plan == nil {
+		return
+	}
+	idx := s.Cfg.Plan.PhaseAt(step)
+	if idx < 0 || idx == s.phaseIdx {
+		return
+	}
+	ph := &s.Cfg.Plan.Phases[idx]
+	s.bc = ph.BC
+	s.srcs = ph.Sources
+	s.phaseIdx = idx
+	s.imposeDirichlet()
+}
+
+// imposeDirichlet 把当前生效边界中 Dirichlet 边的固定值写入 Cur 边界格。
+// 角点被两条 Dirichlet 边共享时，按 left→right→bottom→top 顺序后者覆盖。
+func (s *Stepper) imposeDirichlet() {
+	nx, ny := s.Cur.NX, s.Cur.NY
+	if s.bc.Left.Type == Dirichlet {
+		for j := 0; j < ny; j++ {
+			s.Cur.Set(0, j, s.bc.Left.Value)
+		}
+	}
+	if s.bc.Right.Type == Dirichlet {
+		for j := 0; j < ny; j++ {
+			s.Cur.Set(nx-1, j, s.bc.Right.Value)
+		}
+	}
+	if s.bc.Bottom.Type == Dirichlet {
+		for i := 0; i < nx; i++ {
+			s.Cur.Set(i, 0, s.bc.Bottom.Value)
+		}
+	}
+	if s.bc.Top.Type == Dirichlet {
+		for i := 0; i < nx; i++ {
+			s.Cur.Set(i, ny-1, s.bc.Top.Value)
+		}
+	}
 }
 
 // neighbor 按边界条件取 (i+di, j+dj) 处的值。
@@ -37,14 +101,14 @@ func (s *Stepper) neighbor(g *Grid, i, j, di, dj int) float64 {
 	nx, ny := g.NX, g.NY
 	ni, nj := i+di, j+dj
 	if ni < 0 {
-		switch s.Cfg.BC.Left.Type {
+		switch s.bc.Left.Type {
 		case Periodic:
 			ni = nx - 1
 		default: // Neumann：零通量，鬼格 = 边界格自身
 			ni = 0
 		}
 	} else if ni >= nx {
-		switch s.Cfg.BC.Right.Type {
+		switch s.bc.Right.Type {
 		case Periodic:
 			ni = 0
 		default:
@@ -52,14 +116,14 @@ func (s *Stepper) neighbor(g *Grid, i, j, di, dj int) float64 {
 		}
 	}
 	if nj < 0 {
-		switch s.Cfg.BC.Bottom.Type {
+		switch s.bc.Bottom.Type {
 		case Periodic:
 			nj = ny - 1
 		default:
 			nj = 0
 		}
 	} else if nj >= ny {
-		switch s.Cfg.BC.Top.Type {
+		switch s.bc.Top.Type {
 		case Periodic:
 			nj = 0
 		default:
@@ -71,7 +135,7 @@ func (s *Stepper) neighbor(g *Grid, i, j, di, dj int) float64 {
 
 // fixed 判断 (i,j) 是否位于 Dirichlet 边界上（值固定，不更新）。
 func (s *Stepper) fixed(i, j int) bool {
-	bc := s.Cfg.BC
+	bc := s.bc
 	if i == 0 && bc.Left.Type == Dirichlet {
 		return true
 	}
@@ -87,18 +151,18 @@ func (s *Stepper) fixed(i, j int) bool {
 	return false
 }
 
-// sourceAt 返回 (i,j) 处的源项强度。
+// sourceAt 返回 (i,j) 处的源项强度（多个源区域重叠时强度相加）。
 func (s *Stepper) sourceAt(i, j int) float64 {
-	src := s.Cfg.Src
-	if src == nil {
-		return 0
-	}
 	x := float64(i) / float64(s.Cur.NX-1)
 	y := float64(j) / float64(s.Cur.NY-1)
-	if x >= src.X0 && x <= src.X1 && y >= src.Y0 && y <= src.Y1 {
-		return src.Rate
+	rate := 0.0
+	for k := range s.srcs {
+		src := &s.srcs[k]
+		if x >= src.X0 && x <= src.X1 && y >= src.Y0 && y <= src.Y1 {
+			rate += src.Rate
+		}
 	}
-	return 0
+	return rate
 }
 
 // cellUpdate 计算 (i,j) 处的新值。
@@ -141,6 +205,7 @@ func (s *Stepper) commit() error {
 // Advance 串行推进 n 步；出现 NaN/Inf 时返回 ErrKindStability 错误。
 func (s *Stepper) Advance(n int) error {
 	for k := 0; k < n; k++ {
+		s.applyPhaseForStep(s.Step)
 		s.stepRows(0, s.Cur.NY)
 		if err := s.commit(); err != nil {
 			return err
