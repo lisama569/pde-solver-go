@@ -13,13 +13,16 @@ const (
 
 // Boundary 单边边界条件。
 type Boundary struct {
-	Type  BoundaryType
-	Value float64 // Dirichlet 时的固定值
+	Type  BoundaryType `json:"type"`
+	Value float64      `json:"value"` // Dirichlet 时的固定值
 }
 
 // Boundaries 四边边界条件。
 type Boundaries struct {
-	Left, Right, Top, Bottom Boundary
+	Left   Boundary `json:"left"`
+	Right  Boundary `json:"right"`
+	Top    Boundary `json:"top"`
+	Bottom Boundary `json:"bottom"`
 }
 
 // Source 矩形常源项配置（归一化坐标）。

@@ -15,6 +15,38 @@ type Stepper struct {
 	Cur  *Grid
 	Next *Grid
 	Step int // 已完成的步数
+
+	// 活动配置钩子：为 nil 时使用 Cfg 中的单套边界/源（旧模式，行为不变）。
+	// 阶段运行器在每一步推进前设置它们，从而实现按步切换边界与源项。
+	activeBC      *Boundaries
+	activeSources []PhaseSource
+}
+
+// SetActive 设定下一步推进使用的边界条件与热源集合。
+// 传 nil（仅指 sources）表示该阶段无源，而不是回退到 Cfg.Src；
+// 回退到旧单套配置请调用 ResetActive。
+func (s *Stepper) SetActive(bc *Boundaries, sources []PhaseSource) {
+	s.activeBC = bc
+	if sources == nil {
+		// 用非 nil 空切片区分「阶段模式但无源」与「旧模式」。
+		s.activeSources = []PhaseSource{}
+	} else {
+		s.activeSources = sources
+	}
+}
+
+// ResetActive 回退到 Cfg.BC / Cfg.Src 的旧单套配置（旧代码路径默认即此状态）。
+func (s *Stepper) ResetActive() {
+	s.activeBC = nil
+	s.activeSources = nil
+}
+
+// activeBoundaries 返回当前步使用的边界条件。
+func (s *Stepper) activeBoundaries() Boundaries {
+	if s.activeBC != nil {
+		return *s.activeBC
+	}
+	return s.Cfg.BC
 }
 
 // NewStepper 创建步进器；先校验配置合法性，再校验稳定性条件。
@@ -35,16 +67,17 @@ func NewStepper(cfg *Config, initial *Grid) (*Stepper, error) {
 // di,dj 只有一个非零（五点差分）。
 func (s *Stepper) neighbor(g *Grid, i, j, di, dj int) float64 {
 	nx, ny := g.NX, g.NY
+	bc := s.activeBoundaries()
 	ni, nj := i+di, j+dj
 	if ni < 0 {
-		switch s.Cfg.BC.Left.Type {
+		switch bc.Left.Type {
 		case Periodic:
 			ni = nx - 1
 		default: // Neumann：零通量，鬼格 = 边界格自身
 			ni = 0
 		}
 	} else if ni >= nx {
-		switch s.Cfg.BC.Right.Type {
+		switch bc.Right.Type {
 		case Periodic:
 			ni = 0
 		default:
@@ -52,14 +85,14 @@ func (s *Stepper) neighbor(g *Grid, i, j, di, dj int) float64 {
 		}
 	}
 	if nj < 0 {
-		switch s.Cfg.BC.Bottom.Type {
+		switch bc.Bottom.Type {
 		case Periodic:
 			nj = ny - 1
 		default:
 			nj = 0
 		}
 	} else if nj >= ny {
-		switch s.Cfg.BC.Top.Type {
+		switch bc.Top.Type {
 		case Periodic:
 			nj = 0
 		default:
@@ -71,7 +104,7 @@ func (s *Stepper) neighbor(g *Grid, i, j, di, dj int) float64 {
 
 // fixed 判断 (i,j) 是否位于 Dirichlet 边界上（值固定，不更新）。
 func (s *Stepper) fixed(i, j int) bool {
-	bc := s.Cfg.BC
+	bc := s.activeBoundaries()
 	if i == 0 && bc.Left.Type == Dirichlet {
 		return true
 	}
@@ -87,8 +120,22 @@ func (s *Stepper) fixed(i, j int) bool {
 	return false
 }
 
-// sourceAt 返回 (i,j) 处的源项强度。
+// sourceAt 返回 (i,j) 处的源项强度（多源区重叠时强度相加）。
 func (s *Stepper) sourceAt(i, j int) float64 {
+	if s.activeSources != nil {
+		nx := float64(s.Cur.NX - 1)
+		ny := float64(s.Cur.NY - 1)
+		x := float64(i) / nx
+		y := float64(j) / ny
+		rate := 0.0
+		for k := range s.activeSources {
+			src := &s.activeSources[k]
+			if x >= src.X0 && x <= src.X1 && y >= src.Y0 && y <= src.Y1 {
+				rate += src.Rate
+			}
+		}
+		return rate
+	}
 	src := s.Cfg.Src
 	if src == nil {
 		return 0
