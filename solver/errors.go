@@ -8,6 +8,7 @@ type ErrorKind int
 const (
 	ErrKindConfig    ErrorKind = iota // 非法配置（参数越界、未知边界类型等）
 	ErrKindStability                  // 数值失稳（违反稳定性条件或产生 NaN/Inf）
+	ErrKindBudget                     // 收支对账不闭合（总量变化对不上源注入与边界账）
 )
 
 // Error 是带类别标记的求解器错误。
@@ -39,5 +40,14 @@ func IsStabilityError(err error) bool {
 	return ok && k == ErrKindStability
 }
 
-func configErr(msg string) *Error    { return &Error{Kind: ErrKindConfig, Msg: msg} }
-func stabilityErr(msg string) *Error { return &Error{Kind: ErrKindStability, Msg: msg} }
+// IsBudgetError 判定是否为收支对账不闭合错误。
+func IsBudgetError(err error) bool {
+	k, ok := KindOf(err)
+	return ok && k == ErrKindBudget
+}
+
+func configErr(msg string) error { return &Error{Kind: ErrKindConfig, Msg: msg} }
+func stabilityErr(msg string) *Error {
+	return &Error{Kind: ErrKindStability, Msg: msg}
+}
+func budgetErr(msg string) error { return &Error{Kind: ErrKindBudget, Msg: msg} }

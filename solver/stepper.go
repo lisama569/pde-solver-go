@@ -53,46 +53,62 @@ func NewStepper(cfg *Config, initial *Grid) (*Stepper, error) {
 // 阶段切换只发生在步边界上，是步号的确定性函数，因此断点续算与
 // 不间断运行的切换点完全一致。阶段激活时会把该阶段 Dirichlet 边界的
 // 固定值写入 Cur 的边界格（幂等：同阶段重复激活结果相同）。
-// 无阶段计划或步号超出计划范围时不做任何事。
-func (s *Stepper) applyPhaseForStep(step int) {
+// 返回值为逐边的"边界重置总量跳变" Σ(新值−旧值)·dx·dy；
+// 未发生阶段激活时为零值。该跳变必须计入新阶段的收支账目，
+// 否则跨阶段修改 Dirichlet 值、Dirichlet↔Neumann 切换带来的
+// 总量变化会在账上凭空消失。
+// 无阶段计划或步号超出计划范围时不做任何事，返回零值。
+func (s *Stepper) applyPhaseForStep(step int) BoundaryBudget {
 	if s.Cfg.Plan == nil {
-		return
+		return BoundaryBudget{}
 	}
 	idx := s.Cfg.Plan.PhaseAt(step)
 	if idx < 0 || idx == s.phaseIdx {
-		return
+		return BoundaryBudget{}
 	}
 	ph := &s.Cfg.Plan.Phases[idx]
 	s.bc = ph.BC
 	s.srcs = ph.Sources
 	s.phaseIdx = idx
-	s.imposeDirichlet()
+	return s.imposeDirichlet()
 }
 
-// imposeDirichlet 把当前生效边界中 Dirichlet 边的固定值写入 Cur 边界格。
-// 角点被两条 Dirichlet 边共享时，按 left→right→bottom→top 顺序后者覆盖。
-func (s *Stepper) imposeDirichlet() {
+// imposeDirichlet 把当前生效边界中 Dirichlet 边的固定值写入 Cur 边界格，
+// 返回逐边的总量跳变 Σ(写入值−旧值)·dx·dy（正 = 该边重置向场内注入总量）。
+// 注意重置改写的是整个边界格的值，按格面积 dx·dy 计（与 TotalMass 口径一致），
+// 不同于按边长计的跨边扩散通量。
+// 角点被两条 Dirichlet 边共享时，按 left→right→bottom→top 顺序后者覆盖，
+// 角点跳变计入后写入的那条边，与实际写入结果严格一致。
+func (s *Stepper) imposeDirichlet() BoundaryBudget {
 	nx, ny := s.Cur.NX, s.Cur.NY
+	cellArea := s.Cfg.DX * s.Cfg.DY
+	var jump BoundaryBudget
+	set := func(i, j int, v float64) float64 {
+		old := s.Cur.At(i, j)
+		s.Cur.Set(i, j, v)
+		return v - old
+	}
 	if s.bc.Left.Type == Dirichlet {
 		for j := 0; j < ny; j++ {
-			s.Cur.Set(0, j, s.bc.Left.Value)
+			jump.Left += set(0, j, s.bc.Left.Value) * cellArea
 		}
 	}
 	if s.bc.Right.Type == Dirichlet {
 		for j := 0; j < ny; j++ {
-			s.Cur.Set(nx-1, j, s.bc.Right.Value)
+			jump.Right += set(nx-1, j, s.bc.Right.Value) * cellArea
 		}
 	}
 	if s.bc.Bottom.Type == Dirichlet {
 		for i := 0; i < nx; i++ {
-			s.Cur.Set(i, 0, s.bc.Bottom.Value)
+			jump.Bottom += set(i, 0, s.bc.Bottom.Value) * cellArea
 		}
 	}
 	if s.bc.Top.Type == Dirichlet {
 		for i := 0; i < nx; i++ {
-			s.Cur.Set(i, ny-1, s.bc.Top.Value)
+			jump.Top += set(i, ny-1, s.bc.Top.Value) * cellArea
 		}
 	}
+	return jump
 }
 
 // neighbor 按边界条件取 (i+di, j+dj) 处的值。

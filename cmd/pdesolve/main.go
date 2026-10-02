@@ -190,7 +190,16 @@ func main() {
 	fmt.Printf("done: step=%d mass=%.6f (start %.6f, deviation %+.3e)\n",
 		rep.Step, rep.Total, rep.Expected, rep.Deviation)
 
-	// 逐阶段收支对账
+	// 检查点必须在对账校验之前落盘：对账误报/真不闭合都不应让可恢复的
+	// 运行结果丢失（否则恢复时只能报"找不到文件"）。
+	if *savePath != "" {
+		if err := solver.SaveCheckpointWithConfig(*savePath, endStep, final, cfg); err != nil {
+			fail(err)
+		}
+		fmt.Printf("checkpoint saved to %s at step %d\n", *savePath, endStep)
+	}
+
+	// 逐阶段收支对账（贴边热源按实际施加量统计；跨阶段边界重置跳变单列）
 	for i := range reports {
 		r := &reports[i]
 		status := "OK"
@@ -198,24 +207,28 @@ func main() {
 			status = "IMBALANCE"
 		}
 		fmt.Printf("phase %d steps[%d,%d): deltaMass=%+.6e srcTotal=%+.6e "+
-			"boundary{L:%+.4e R:%+.4e T:%+.4e B:%+.4e} closure=%+.3e tol=%.1e %s\n",
+			"influx{L:%+.4e R:%+.4e T:%+.4e B:%+.4e} "+
+			"reset{L:%+.4e R:%+.4e T:%+.4e B:%+.4e} closure=%+.3e tol=%.1e %s\n",
 			r.PhaseIndex, r.FromStep, r.ToStep, r.DeltaMass(), r.SourceTotal(),
 			r.Boundary.Left, r.Boundary.Right, r.Boundary.Top, r.Boundary.Bottom,
+			r.BoundaryReset.Left, r.BoundaryReset.Right, r.BoundaryReset.Top, r.BoundaryReset.Bottom,
 			r.Closure(), r.ClosureTol(), status)
 		for si, inj := range r.SourceInject {
 			fmt.Printf("  phase %d source %d injected=%+.6e\n", r.PhaseIndex, si, inj)
 		}
-		if !r.Balanced() {
-			os.Exit(1)
-		}
 	}
-
-	if *savePath != "" {
-		if err := solver.SaveCheckpointWithConfig(*savePath, endStep, final, cfg); err != nil {
-			fail(err)
-		}
-		fmt.Printf("checkpoint saved to %s at step %d\n", *savePath, endStep)
+	// 整任务总账：各阶段 ΔMass 之和必须等于从头到尾的真实总量变化
+	// （含任务首次激活阶段0 Dirichlet 与每次跨阶段切换的重置跳变）。
+	if err := solver.VerifyReports(reports); err != nil {
+		fail(err)
 	}
+	sumDelta := 0.0
+	for i := range reports {
+		sumDelta += reports[i].DeltaMass()
+	}
+	fmt.Printf("task ledger: ΣphaseΔMass=%+.6e trueChange=%+.6e (%.6f -> %.6f): closed\n",
+		sumDelta, reports[len(reports)-1].MassEnd-reports[0].MassStart,
+		reports[0].MassStart, reports[len(reports)-1].MassEnd)
 }
 
 // fail 按错误类别打印可区分的失败原因并退出。
@@ -225,6 +238,8 @@ func fail(err error) {
 		fmt.Fprintf(os.Stderr, "CONFIG ERROR: %v\n", err)
 	case solver.IsStabilityError(err):
 		fmt.Fprintf(os.Stderr, "STABILITY ERROR: %v\n", err)
+	case solver.IsBudgetError(err):
+		fmt.Fprintf(os.Stderr, "BUDGET ERROR: %v\n", err)
 	default:
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 	}
