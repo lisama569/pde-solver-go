@@ -2,12 +2,13 @@ package solver
 
 import "errors"
 
-// ErrorKind 区分失败原因：非法配置 / 数值失稳。
+// ErrorKind 区分失败原因：非法配置 / 数值失稳 / 收支对账不闭合。
 type ErrorKind int
 
 const (
 	ErrKindConfig    ErrorKind = iota // 非法配置（参数越界、未知边界类型等）
 	ErrKindStability                  // 数值失稳（违反稳定性条件或产生 NaN/Inf）
+	ErrKindBudget                     // 收支对账不闭合（总量变化与源/边界账目对不上）
 )
 
 // Error 是带类别标记的求解器错误。
@@ -39,5 +40,12 @@ func IsStabilityError(err error) bool {
 	return ok && k == ErrKindStability
 }
 
+// IsBudgetError 判定是否为收支对账不闭合错误。
+func IsBudgetError(err error) bool {
+	k, ok := KindOf(err)
+	return ok && k == ErrKindBudget
+}
+
 func configErr(msg string) *Error    { return &Error{Kind: ErrKindConfig, Msg: msg} }
 func stabilityErr(msg string) *Error { return &Error{Kind: ErrKindStability, Msg: msg} }
+func budgetErr(msg string) *Error    { return &Error{Kind: ErrKindBudget, Msg: msg} }

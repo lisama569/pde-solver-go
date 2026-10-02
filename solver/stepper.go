@@ -54,45 +54,65 @@ func NewStepper(cfg *Config, initial *Grid) (*Stepper, error) {
 // 不间断运行的切换点完全一致。阶段激活时会把该阶段 Dirichlet 边界的
 // 固定值写入 Cur 的边界格（幂等：同阶段重复激活结果相同）。
 // 无阶段计划或步号超出计划范围时不做任何事。
-func (s *Stepper) applyPhaseForStep(step int) {
+//
+// 返回本次激活造成的逐边质量跳变（Dirichlet 重置量，正 = 总量增加）；
+// 未发生切换或无计划时返回零值。该跳变是切换瞬间的边界重置，不是扩散
+// 通量，但必须计入收支账目（见 RunPhases），否则跨阶段改边值时
+// 各阶段总量变化之和会对不上任务真实变化。
+func (s *Stepper) applyPhaseForStep(step int) BoundaryBudget {
 	if s.Cfg.Plan == nil {
-		return
+		return BoundaryBudget{}
 	}
 	idx := s.Cfg.Plan.PhaseAt(step)
 	if idx < 0 || idx == s.phaseIdx {
-		return
+		return BoundaryBudget{}
 	}
 	ph := &s.Cfg.Plan.Phases[idx]
 	s.bc = ph.BC
 	s.srcs = ph.Sources
 	s.phaseIdx = idx
-	s.imposeDirichlet()
+	return s.imposeDirichlet()
 }
 
 // imposeDirichlet 把当前生效边界中 Dirichlet 边的固定值写入 Cur 边界格。
 // 角点被两条 Dirichlet 边共享时，按 left→right→bottom→top 顺序后者覆盖。
-func (s *Stepper) imposeDirichlet() {
+//
+// 返回逐边的质量跳变（写入前后差值 × dx·dy 的累计）。角点被两条边先后
+// 覆盖时，跳变按写入次序拆分到两条边上（前者记 新值−旧值，后者记
+// 最终值−新值），各边之和仍严格等于该格的实际质量变化。
+func (s *Stepper) imposeDirichlet() BoundaryBudget {
+	var b BoundaryBudget
+	cell := s.Cfg.DX * s.Cfg.DY
 	nx, ny := s.Cur.NX, s.Cur.NY
 	if s.bc.Left.Type == Dirichlet {
 		for j := 0; j < ny; j++ {
+			old := s.Cur.At(0, j)
 			s.Cur.Set(0, j, s.bc.Left.Value)
+			b.Left += (s.bc.Left.Value - old) * cell
 		}
 	}
 	if s.bc.Right.Type == Dirichlet {
 		for j := 0; j < ny; j++ {
+			old := s.Cur.At(nx-1, j)
 			s.Cur.Set(nx-1, j, s.bc.Right.Value)
+			b.Right += (s.bc.Right.Value - old) * cell
 		}
 	}
 	if s.bc.Bottom.Type == Dirichlet {
 		for i := 0; i < nx; i++ {
+			old := s.Cur.At(i, 0)
 			s.Cur.Set(i, 0, s.bc.Bottom.Value)
+			b.Bottom += (s.bc.Bottom.Value - old) * cell
 		}
 	}
 	if s.bc.Top.Type == Dirichlet {
 		for i := 0; i < nx; i++ {
+			old := s.Cur.At(i, ny-1)
 			s.Cur.Set(i, ny-1, s.bc.Top.Value)
+			b.Top += (s.bc.Top.Value - old) * cell
 		}
 	}
+	return b
 }
 
 // neighbor 按边界条件取 (i+di, j+dj) 处的值。

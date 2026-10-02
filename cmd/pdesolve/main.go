@@ -202,19 +202,32 @@ func main() {
 			r.PhaseIndex, r.FromStep, r.ToStep, r.DeltaMass(), r.SourceTotal(),
 			r.Boundary.Left, r.Boundary.Right, r.Boundary.Top, r.Boundary.Bottom,
 			r.Closure(), r.ClosureTol(), status)
+		if r.Reset.Total() != 0 {
+			fmt.Printf("  phase %d dirichlet reset{L:%+.4e R:%+.4e T:%+.4e B:%+.4e} (included in boundary)\n",
+				r.PhaseIndex, r.Reset.Left, r.Reset.Right, r.Reset.Top, r.Reset.Bottom)
+		}
 		for si, inj := range r.SourceInject {
 			fmt.Printf("  phase %d source %d injected=%+.6e\n", r.PhaseIndex, si, inj)
 		}
-		if !r.Balanced() {
-			os.Exit(1)
-		}
+	}
+	// 任务级对账：各阶段总量变化之和 == 任务从头到尾的真实变化
+	if len(reports) > 0 {
+		sumDelta := solver.TotalDeltaMass(reports)
+		trueDelta := reports[len(reports)-1].MassEnd - reports[0].MassStart
+		fmt.Printf("task: sum(phase deltaMass)=%+.6e true deltaMass=%+.6e residual=%+.3e\n",
+			sumDelta, trueDelta, sumDelta-trueDelta)
 	}
 
+	// 先落盘再判对账：检查点不能因为对账结果而被跳过
 	if *savePath != "" {
 		if err := solver.SaveCheckpointWithConfig(*savePath, endStep, final, cfg); err != nil {
 			fail(err)
 		}
 		fmt.Printf("checkpoint saved to %s at step %d\n", *savePath, endStep)
+	}
+
+	if err := solver.CheckBudgets(reports); err != nil {
+		fail(err)
 	}
 }
 
@@ -225,6 +238,8 @@ func fail(err error) {
 		fmt.Fprintf(os.Stderr, "CONFIG ERROR: %v\n", err)
 	case solver.IsStabilityError(err):
 		fmt.Fprintf(os.Stderr, "STABILITY ERROR: %v\n", err)
+	case solver.IsBudgetError(err):
+		fmt.Fprintf(os.Stderr, "BUDGET ERROR: %v\n", err)
 	default:
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 	}
